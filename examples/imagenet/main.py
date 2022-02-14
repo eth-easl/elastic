@@ -64,11 +64,18 @@ import torch.utils.data.distributed
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
-from torch.distributed.elastic.utils.data import ElasticDistributedSampler
+from torchelastic.utils.data import ElasticDistributedSampler
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import SGD
 from torch.utils.data import DataLoader
 
+from operator import itemgetter
+
+# Imports the Google Cloud client library
+from google.cloud import storage
+
+client = storage.Client() # need to set up credentials
+bucket = client.get_bucket('torchelastic')
 
 model_names = sorted(
     name
@@ -146,6 +153,21 @@ parser.add_argument(
     help="checkpoint file path, to load and save to",
 )
 
+parser.add_argument(
+    "--local_rank",
+    default=0,
+    type=int,
+    help="local rank - not used",
+)
+
+
+parser.add_argument(
+    "--ch-freq",
+    default=10,
+    type=int,
+    help="checkpoint frequency (iterations)",
+)
+
 
 def main():
     args = parser.parse_args()
@@ -153,25 +175,33 @@ def main():
     torch.cuda.set_device(device_id)
     print(f"=> set cuda device = {device_id}")
 
+    # when using NCCL, on failures, surviving nodes will deadlock on NCCL ops
+    # because NCCL uses a spin-lock on the device. Set this env var and
+    # to enable a watchdog thread that will destroy stale NCCL communicators
+    os.environ["NCCL_BLOCKING_WAIT"] = "1"
+
     dist.init_process_group(
         backend=args.dist_backend, init_method="env://", timeout=timedelta(seconds=10)
     )
 
+    print("-----initialize model------")
     model, criterion, optimizer = initialize_model(
         args.arch, args.lr, args.momentum, args.weight_decay, device_id
     )
 
+    print("----------- init data loader---------")
     train_loader, val_loader = initialize_data_loader(
         args.data, args.batch_size, args.workers
     )
 
+    print("LOAD CHECKPOINT")
     # resume from checkpoint if one exists;
     state = load_checkpoint(
         args.checkpoint_file, device_id, args.arch, model, optimizer
     )
 
     start_epoch = state.epoch + 1
-    print(f"=> start_epoch: {start_epoch}, best_acc1: {state.best_acc1}")
+    print(f"=> start_epoch: {start_epoch}, best_acc1: ©{state.best_acc1}")
 
     print_freq = args.print_freq
     for epoch in range(start_epoch, args.epochs):
@@ -180,7 +210,7 @@ def main():
         adjust_learning_rate(optimizer, epoch, args.lr)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq)
+        train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq, state, args.checkpoint_file, args.ch_freq)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, device_id, print_freq)
@@ -189,8 +219,8 @@ def main():
         is_best = acc1 > state.best_acc1
         state.best_acc1 = max(acc1, state.best_acc1)
 
-        if device_id == 0:
-            save_checkpoint(state, is_best, args.checkpoint_file)
+        #if device_id == 0:
+        #    save_checkpoint(state, is_best, args.checkpoint_file)
 
 
 class State:
@@ -249,7 +279,7 @@ class State:
 def initialize_model(
     arch: str, lr: float, momentum: float, weight_decay: float, device_id: int
 ):
-    print(f"=> creating model: {arch}")
+    print(f"=> creating model: {arch}, device_id: {device_id}")
     model = models.__dict__[arch]()
     # For multiprocessing distributed, DistributedDataParallel constructor
     # should always set the single device scope, otherwise,
@@ -257,6 +287,7 @@ def initialize_model(
     model.cuda(device_id)
     cudnn.benchmark = True
     model = DistributedDataParallel(model, device_ids=[device_id])
+    print("after calling DDP")
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(device_id)
     optimizer = SGD(
@@ -335,57 +366,29 @@ def load_checkpoint(
 
     state = State(arch, model, optimizer)
 
-    if os.path.isfile(checkpoint_file):
-        print(f"=> loading checkpoint file: {checkpoint_file}")
-        state.load(checkpoint_file, device_id)
-        print(f"=> loaded checkpoint file: {checkpoint_file}")
+    allcheckp = []
+    for blob in client.list_blobs('torchelastic'):
+        print(blob.name, blob.updated)
+        allcheckp.append([blob.name, blob.updated])
 
-    # logic below is unnecessary when the checkpoint is visible on all nodes!
-    # create a temporary cpu pg to broadcast most up-to-date checkpoint
-    with tmp_process_group(backend="gloo") as pg:
-        rank = dist.get_rank(group=pg)
+    allcheckp.sort(key=itemgetter(1), reverse=True)
+    print(allcheckp)
 
-        # get rank that has the largest state.epoch
-        epochs = torch.zeros(dist.get_world_size(), dtype=torch.int32)
-        epochs[rank] = state.epoch
-        dist.all_reduce(epochs, op=dist.ReduceOp.SUM, group=pg)
-        t_max_epoch, t_max_rank = torch.max(epochs, dim=0)
-        max_epoch = t_max_epoch.item()
-        max_rank = t_max_rank.item()
+    for chk in allcheckp:
+        try:
+            print("Try to download from object ", chk[0])
+            # download
+            blob = bucket.blob(chk[0])
+            buf = io.BytesIO()
+            blob.download_to_file(buf)
 
-        # max_epoch == -1 means no one has checkpointed return base state
-        if max_epoch == -1:
-            print(f"=> no workers have checkpoints, starting from epoch 0")
-            return state
+            # load
+            buf.seek(0)
+            state.load(buf, device_id)
+            break
+        except (RuntimeError, TypeError):
+            print("[WARNING!] Checkpoint with name ", chk[0], " not valid. Retrying with older checkpoint!")
 
-        # broadcast the state from max_rank (which has the most up-to-date state)
-        # pickle the snapshot, convert it into a byte-blob tensor
-        # then broadcast it, unpickle it and apply the snapshot
-        print(f"=> using checkpoint from rank: {max_rank}, max_epoch: {max_epoch}")
-
-        with io.BytesIO() as f:
-            torch.save(state.capture_snapshot(), f)
-            raw_blob = numpy.frombuffer(f.getvalue(), dtype=numpy.uint8)
-
-        blob_len = torch.tensor(len(raw_blob))
-        dist.broadcast(blob_len, src=max_rank, group=pg)
-        print(f"=> checkpoint broadcast size is: {blob_len}")
-
-        if rank != max_rank:
-            blob = torch.zeros(blob_len.item(), dtype=torch.uint8)
-        else:
-            blob = torch.as_tensor(raw_blob, dtype=torch.uint8)
-
-        dist.broadcast(blob, src=max_rank, group=pg)
-        print(f"=> done broadcasting checkpoint")
-
-        if rank != max_rank:
-            with io.BytesIO(blob.numpy()) as f:
-                snapshot = torch.load(f)
-            state.apply_snapshot(snapshot, device_id)
-
-        # wait till everyone has loaded the checkpoint
-        dist.barrier(group=pg)
 
     print(f"=> done restoring from previous checkpoint")
     return state
@@ -400,16 +403,42 @@ def tmp_process_group(backend):
         dist.destroy_process_group(cpu_pg)
 
 
-def save_checkpoint(state: State, is_best: bool, filename: str):
+def save_checkpoint(state: State, is_best: bool, filename: str, i: int, local: bool):
     checkpoint_dir = os.path.dirname(filename)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # save to tmp, then commit by moving the file in case the job
     # gets interrupted while writing the checkpoint
     tmp_filename = filename + ".tmp"
-    torch.save(state.capture_snapshot(), tmp_filename)
-    os.rename(tmp_filename, filename)
-    print(f"=> saved checkpoint for epoch {state.epoch} at {filename}")
+
+    start = time.time()
+
+    if local:
+        torch.save(state.capture_snapshot(), tmp_filename) 
+        f = open(tmp_filename, 'a+')
+        os.fsync(f.fileno())
+        f.close()
+    else:
+        buf = io.BytesIO() # kept in memory
+        torch.save(state.capture_snapshot(), buf)
+        buf.seek(0)  
+    print("local save took: ", time.time()-start)
+    
+    if not local:
+        rem = time.time()
+        new_blob = bucket.blob('model'+str(i)+'.chk')
+        new_blob.upload_from_file(buf)
+
+        #with open(tmp_filename, "rb") as f:
+        #    new_blob.upload_from_file(f)
+        #new_blob.upload_from_filename(tmp_filename)
+        #os.system("gsutil -m -o GSUtil:parallel_composite_upload_threshold=500M cp /tmp/checkpoint.pth.tar gs://torchelastic")
+        print("uploading took: ", time.time()-rem)
+
+    if local:
+        os.rename(tmp_filename, filename)
+        print(f"=> saved checkpoint for epoch {state.epoch} at {filename}")
+    
     if is_best:
         best = os.path.join(checkpoint_dir, "model_best.pth.tar")
         print(f"=> best model found at epoch {state.epoch} saving to {best}")
@@ -424,6 +453,9 @@ def train(
     epoch: int,
     device_id: int,
     print_freq: int,
+    state,
+    chk_file,
+    ch_freq
 ):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
@@ -440,6 +472,7 @@ def train(
     model.train()
 
     end = time.time()
+    print("---- Start!")
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -468,6 +501,11 @@ def train(
 
         if i % print_freq == 0:
             progress.display(i)
+
+        if i%ch_freq==0:
+            if device_id == 0:
+                save_checkpoint(state, False, chk_file, i, False)
+
 
 
 def validate(
@@ -592,3 +630,5 @@ def accuracy(output, target, topk=(1,)):
 
 if __name__ == "__main__":
     main()
+
+
