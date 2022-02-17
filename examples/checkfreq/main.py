@@ -77,8 +77,8 @@ from torch.multiprocessing import Pool, Process, set_start_method, Manager, Valu
 import ctypes
 import chk_manager
 
-client = storage.Client() # need to set up credentials
-bucket = client.get_bucket('torchelastic')
+#client = storage.Client() # need to set up credentials
+#bucket = client.get_bucket('torchelastic')
 
 model_names = sorted(
     name
@@ -215,6 +215,11 @@ def main():
 
     start_epoch = max(state.epoch, 0)
     start_iter = state.iter + 1
+
+    if start_iter == len(train_loader):
+        start_epoch += 1
+        start_iter = 0
+
     print(f"=> start_epoch: {start_epoch}, start_iter: {start_iter}")
 
     print_freq = args.print_freq
@@ -419,7 +424,7 @@ def load_checkpoint(
 
     state = State(arch, model, optimizer)
 
-    
+    '''   
     allcheckp = []
     for blob in client.list_blobs('torchelastic'):
 
@@ -445,7 +450,7 @@ def load_checkpoint(
         except (RuntimeError, TypeError):
             print("[WARNING!] Checkpoint with name ", chk[0], " not valid. Retrying with older checkpoint!")
     
-
+    '''
     print(f"=> done restoring from previous checkpoint")
     return state
 
@@ -459,11 +464,12 @@ def tmp_process_group(backend):
         dist.destroy_process_group(cpu_pg)
 
 
-def save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, it, change, profile_snap, prof_snap=False, prof_all=False, sync=False):
+def save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, it, change, profile_snap, ch_freq, prof_snap=False, prof_all=False, sync=False):
     
     start = time.time()
     additional_snapshot['epoch'] = epoch
     additional_snapshot['iter'] = it
+    additional_snapshot['ch_freq'] = ch_freq
 
     if sync:
         chk.checkpoint()
@@ -616,7 +622,7 @@ def train(
 
             elif (profile_done or epoch > 0) and ch_freq>0 and steps_since_checkp==ch_freq:
                 print("Checkpoint, at epoch: ", epoch, ", and iteration: ", i)
-                save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, i, change, profile_snap)
+                save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, i, change, profile_snap, ch_freq)
                 steps_since_checkp = 1
 
             elif (profile_done or epoch > 0) and ch_freq>0:
@@ -664,18 +670,18 @@ def do_profile(iter_dur, additional_snapshot, chk, active_snapshot, lock, epoch,
 
     ## first, do a simple checkpoint call to create the background processes
     save_checkpoint(additional_snapshot, chk, active_snapshot, lock, \
-                        epoch, it, change, profile_snap, prof_snap=False, prof_all=True)
+                        epoch, it, change, profile_snap, 0, prof_snap=False, prof_all=True)
 
     ## now measure the time the snapshot takes
     start = time.time()
     save_checkpoint(additional_snapshot, chk, active_snapshot, lock, \
-                        epoch, it, change, profile_snap, prof_snap=True, prof_all=False)
+                        epoch, it, change, profile_snap, 0, prof_snap=True, prof_all=False)
     overhead = time.time()-start
 
     ## finally, measure the time the actual checkpoint (snapshot + persist) takes
     start = time.time()
     save_checkpoint(additional_snapshot, chk, active_snapshot, lock, \
-                        epoch, it, change, profile_snap, prof_snap=False, prof_all=True)
+                        epoch, it, change, profile_snap, 0,  prof_snap=False, prof_all=True)
     t_f = time.time()-start
 
     ## Check Freq, to minimize stall at training

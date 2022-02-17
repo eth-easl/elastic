@@ -91,8 +91,8 @@ class CFCheckpoint():
                 profile_snap = None):
 
 
-        self.client = storage.Client() # need to set up credentials
-        self.bucket = self.client.get_bucket('torchelastic')
+        #self.client = storage.Client() # need to set up credentials
+        #self.bucket = self.client.get_bucket('torchelastic')
 
         while True:
 
