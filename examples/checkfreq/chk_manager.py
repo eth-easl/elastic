@@ -87,7 +87,8 @@ class CFCheckpoint():
 		lock,
 		change,
 		additional_state=None,
-		background=False):
+		background=False,
+                profile_snap = None):
 
 
         self.client = storage.Client() # need to set up credentials
@@ -111,7 +112,8 @@ class CFCheckpoint():
                 with lock:
                     active_snapshot.value = 0
             else:
-                change.value=0
+                with lock:
+                    change.value=0
                 self.logger.error("Cannot persist. Empty snapshot")
                 return
 
@@ -119,6 +121,13 @@ class CFCheckpoint():
             snapshot = self.latest_snapshot
             skeys = list(snapshot['optimizer']['state'].keys())
             k = skeys[-1]
+
+            with lock:
+                if background and profile_snap.value == 1:
+                    # don't checkpoint
+                    snapshot={}
+                    change.value=0
+                    continue
 
             # do the actual checkpoint here
             print("-- FROM CHECKPOINT: ", k, snapshot['optimizer']['state'][k])
@@ -133,14 +142,15 @@ class CFCheckpoint():
             torch.save(snapshot, buf)
             buf.seek(0)  
 
+            
             epoch = snapshot['epoch']
             it = snapshot['iter']
 
             new_blob = self.bucket.blob('model_ep'+str(epoch)+'_it'+str(it)+'.chk')
             new_blob.upload_from_file(buf)
-        
+            
             print("checkpointing in GCS took: ", time.time()-rem)
-
+            
 
             with lock:
                 snapshot={}

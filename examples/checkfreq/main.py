@@ -68,12 +68,17 @@ from torchelastic.utils.data import ElasticDistributedSampler
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import SGD
 from torch.utils.data import DataLoader
+from google.cloud import storage
 
+from statistics import mean
+import math
 from operator import itemgetter
 from torch.multiprocessing import Pool, Process, set_start_method, Manager, Value, Lock, freeze_support, spawn
 import ctypes
 import chk_manager
 
+client = storage.Client() # need to set up credentials
+bucket = client.get_bucket('torchelastic')
 
 model_names = sorted(
     name
@@ -166,6 +171,15 @@ parser.add_argument(
     help="checkpoint frequency (iterations)",
 )
 
+parser.add_argument('--profile', type=bool, default=True,
+                    help='whether to profile or not according to CheckFreq')
+
+parser.add_argument('--prof-steps', type=int, default=50,
+                    help='number of steps to profile for')
+
+parser.add_argument('--max-overhead', type=int, default=5,
+                    help='overhead (%) of checkpointing over the total execution')
+
 
 def main():
     args = parser.parse_args()
@@ -180,7 +194,7 @@ def main():
     os.environ["NCCL_BLOCKING_WAIT"] = "1"
 
     dist.init_process_group(
-        backend="gloo", init_method="env://", timeout=timedelta(seconds=10)
+        backend="nccl", init_method="env://", timeout=timedelta(seconds=10)
     )
 
     print("-----initialize model------")
@@ -199,8 +213,9 @@ def main():
         args.checkpoint_file, device_id, args.arch, model, optimizer
     )
 
-    start_epoch = state.epoch + 1
-    print(f"=> start_epoch: {start_epoch}, best_acc1: ©{state.best_acc1}")
+    start_epoch = max(state.epoch, 0)
+    start_iter = state.iter + 1
+    print(f"=> start_epoch: {start_epoch}, start_iter: {start_iter}")
 
     print_freq = args.print_freq
     
@@ -217,12 +232,7 @@ def main():
     active_snapshot = Value('i', 0)
     lock = Lock()
     mp_manager = Manager()
-
-    ''''
-    iter = Value('i', 0)
-    epoch = Value('i', 0)
-    last_chk_it = Value('i', -1)
-    '''
+    profile_snap = Value('i', 0)
 
     change = Value('i', 0)					
     additional_snapshot = mp_manager.dict()
@@ -234,9 +244,14 @@ def main():
         train_loader.batch_sampler.sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args.lr)
 
+        if epoch == start_epoch:
+            siter = start_iter
+        else:
+            siter = 0
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq, 
-                    args.ch_freq, additional_snapshot, chk, active_snapshot, lock, change, global_rank)
+        train(train_loader, model, criterion, optimizer, epoch, siter, device_id, print_freq, 
+                    args.ch_freq, additional_snapshot, chk, active_snapshot, lock, change, global_rank,
+                    args.profile, args.prof_steps, args.max_overhead, profile_snap)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, device_id, print_freq)
@@ -258,6 +273,7 @@ class State:
     def __init__(self, arch, model, optimizer):
         self.epoch = -1
         self.best_acc1 = 0
+        self.iter = -1
         self.arch = arch
         self.model = model
         self.optimizer = optimizer
@@ -286,12 +302,15 @@ class State:
         snapshot object that was returned by ``capture_snapshot()``.
         This function mutates this state object.
         """
+        print(self.model.state_dict()['module.fc.bias'])
 
+        print(obj.keys())
         self.epoch = obj["epoch"]
-        self.best_acc1 = obj["best_acc1"]
-        self.state_dict = obj["state_dict"]
-        self.model.load_state_dict(obj["state_dict"])
+        self.iter = obj["iter"]
+        self.model.load_state_dict(obj["model"])
         self.optimizer.load_state_dict(obj["optimizer"])
+
+        print(self.model.state_dict()['module.fc.bias'])
 
     def save(self, f):
         torch.save(self.capture_snapshot(), f)
@@ -315,7 +334,7 @@ def initialize_model(
     model = DistributedDataParallel(model, device_ids=[device_id])
     print("after calling DDP")
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss() #.cuda(device_id)
+    criterion = nn.CrossEntropyLoss().cuda(device_id)
     optimizer = SGD(
         model.parameters(), lr, momentum=momentum, weight_decay=weight_decay
     )
@@ -400,9 +419,10 @@ def load_checkpoint(
 
     state = State(arch, model, optimizer)
 
-    '''
+    
     allcheckp = []
     for blob in client.list_blobs('torchelastic'):
+
         print(blob.name, blob.updated)
         allcheckp.append([blob.name, blob.updated])
 
@@ -424,7 +444,7 @@ def load_checkpoint(
             break
         except (RuntimeError, TypeError):
             print("[WARNING!] Checkpoint with name ", chk[0], " not valid. Retrying with older checkpoint!")
-    '''
+    
 
     print(f"=> done restoring from previous checkpoint")
     return state
@@ -439,7 +459,7 @@ def tmp_process_group(backend):
         dist.destroy_process_group(cpu_pg)
 
 
-def save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, it, change, sync=False):
+def save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, it, change, profile_snap, prof_snap=False, prof_all=False, sync=False):
     
     start = time.time()
     additional_snapshot['epoch'] = epoch
@@ -454,13 +474,22 @@ def save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, it, 
                 continue
 
 		# Once complete, initiate the next checkpoint
+
+        if prof_snap:
+            with lock:
+                profile_snap.value = 1
+        else:
+            with lock:
+                profile_snap.value = 0
+
         with lock:
                 change.value = 1
 
         if not chk.spawned:
             print("------------- START A NEW PROCESS!! ------------")
             keywords = { \
-					'background': True}
+					'background': True,
+                                        'profile_snap': profile_snap}
             chk.chk_process = \
 					Process(target=chk.checkpoint,	\
 						args=[active_snapshot, lock, change, additional_snapshot], kwargs=keywords)
@@ -470,19 +499,21 @@ def save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, it, 
             print("-------- Background checkpoint process with pid: ", chk.chk_process.pid, " started!")
 
         # wait for the checkpoint/snapshot to complete if needed
-        if sync:
+        if sync or prof_snap or prof_all:
             while change.value==1:		
                 continue
+
     
     end = time.time()
     print("store checkp took: ", time.time() - start)  
 
 def train(
-    train_loader: DataLoader,
+    train_loader,
     model: DistributedDataParallel,
     criterion,  # nn.CrossEntropyLoss
     optimizer,  # SGD,
     epoch: int,
+    start_iter: int,
     device_id: int,
     print_freq: int,
     ch_freq,
@@ -491,7 +522,8 @@ def train(
     active_snapshot,
     lock,
     change,
-    global_rank
+    global_rank,
+    profile, prof_steps, max_overhead, profile_snap
 ):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
@@ -507,12 +539,30 @@ def train(
     # switch to train mode
     model.train()
 
+    # for CheckFreq-based profiling
+    profile_done = False
+    iter_times = []
+    steps = 0
+    steps_since_checkp = 0
+    base_iter_time = 0
+    skip_iter = False
+    monitor=False
+    monitor_steps = 0
+
     end = time.time()
-    print("---- Start!")
-    for i, (images, target) in enumerate(train_loader):
+    print("---- Start epoch: ", epoch, " from iteration: ", start_iter)
+
+    train_iter = enumerate(train_loader)
+
+    for _ in range(start_iter):
+        next(train_iter)
+
+    for i, (images, target) in train_iter:
         # measure data loading time
         data_time.update(time.time() - end)
 
+        start = time.time()
+        
         images = images.cuda(device_id, non_blocking=True)
         target = target.cuda(device_id, non_blocking=True)
 
@@ -537,6 +587,7 @@ def train(
 
         # now compute sgd
         optimizer.step()
+        
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -548,11 +599,91 @@ def train(
         if i % print_freq == 0:
             progress.display(i)
 
-        if i%ch_freq==0:
-            if global_rank == 0:
-                print("---- FROM OPT: ", optimizer.state_dict()['state'][k])
-                save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, i, change, False)
+        if global_rank == 0:
+            
+            if profile and epoch==0 and (not profile_done) and i >= 5:
+                print("---------- Profile step: ", i)
+                iter_times.append(end-start)
+                steps+=1
+                if steps == prof_steps:
+                    # profile
+                    base_iter_time, ch_freq = do_profile(iter_times, additional_snapshot, chk, active_snapshot, lock, epoch, i, change, profile_snap)
+                    profile_done = True
+                    steps_since_checkp = 0
+                    iter_times = []
+                    skip_iter = True
+                    monitor_steps = 0
 
+            elif (profile_done or epoch > 0) and ch_freq>0 and steps_since_checkp==ch_freq:
+                print("Checkpoint, at epoch: ", epoch, ", and iteration: ", i)
+                save_checkpoint(additional_snapshot, chk, active_snapshot, lock, epoch, i, change, profile_snap)
+                steps_since_checkp = 1
+
+            elif (profile_done or epoch > 0) and ch_freq>0:
+                steps_since_checkp += 1
+
+            if profile and profile_done and epoch==0:
+                if not monitor:
+                    monitor= True
+                if monitor and not skip_iter:
+                    iter_times.append(end-start)
+                    monitor_steps += 1
+                    #print("Monitor steps is: ", monitor_steps)
+                    if monitor_steps == ch_freq:
+                        # adapt freq
+                        ch_freq = adapt_chfreq(iter_times, base_iter_time, ch_freq, max_overhead)
+                        iter_times = []
+                        monitor_steps = 0
+                if skip_iter:
+                    skip_iter = False
+
+
+def adapt_chfreq(iter_dur, base_iter_time, cfreq, max_overhead):
+
+    cur_iter_mean = mean(iter_dur)
+    cur_total = sum(iter_dur)
+    old_total = base_iter_time * len(iter_dur)
+
+    overhead_full = cur_total-old_total
+    overhead_perc = 100 * overhead_full/old_total
+
+    print("--------------- Iter mean new is: ", cur_iter_mean)
+    print("--------------- Overhead is: ", overhead_perc)
+
+    if overhead_perc > max_overhead:
+        cfreq += 2
+        print("-------------------------------- New Checkpoint Freq found: ", cfreq)
+
+    return cfreq
+
+
+def do_profile(iter_dur, additional_snapshot, chk, active_snapshot, lock, epoch, it, change, profile_snap):
+
+    print(iter_dur)
+    t_i = mean(iter_dur)
+
+    ## first, do a simple checkpoint call to create the background processes
+    save_checkpoint(additional_snapshot, chk, active_snapshot, lock, \
+                        epoch, it, change, profile_snap, prof_snap=False, prof_all=True)
+
+    ## now measure the time the snapshot takes
+    start = time.time()
+    save_checkpoint(additional_snapshot, chk, active_snapshot, lock, \
+                        epoch, it, change, profile_snap, prof_snap=True, prof_all=False)
+    overhead = time.time()-start
+
+    ## finally, measure the time the actual checkpoint (snapshot + persist) takes
+    start = time.time()
+    save_checkpoint(additional_snapshot, chk, active_snapshot, lock, \
+                        epoch, it, change, profile_snap, prof_snap=False, prof_all=True)
+    t_f = time.time()-start
+
+    ## Check Freq, to minimize stall at training
+    chk_freq = max(math.ceil((t_f - overhead)/t_i), 1)
+    print("t_i: ", t_i, " , overhead: ", overhead, " , t_f: ", t_f)
+    print("------------ CheckFreq found: ", chk_freq)
+
+    return t_i, chk_freq
 
 
 def validate(
