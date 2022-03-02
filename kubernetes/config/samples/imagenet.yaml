@@ -5,27 +5,39 @@ metadata:
   namespace: elastic-job
 spec:
   # Use "etcd-service:2379" if you already apply etcd.yaml
-  rdzvEndpoint: "10.40.3.170:2379"
-  minReplicas: 2
-  maxReplicas: 2
+  rdzvEndpoint: "etcd-service:2379"
+  minReplicas: 1
+  maxReplicas: 4
   replicaSpecs:
     Worker:
-      replicas: 2
+      replicas: 4
       restartPolicy: ExitCode
       template:
         apiVersion: v1
         kind: Pod
         spec:
+          restartPolicy: "Never"
+          maxRetries: "20"  
+          tolerations:
+          - key: "node.kubernetes.io/unreachable"
+            operator: "Exists"
+            effect: "NoExecute"
+            tolerationSeconds: 10
+          - key: "node.kubernetes.io/not-ready"
+            operator: "Exists"
+            effect: "NoExecute"
+            tolerationSeconds: 10
           containers:
             - name: elasticjob-worker
               image: fotstrt/torchelastic #torchelastic/examples:0.2.0
               imagePullPolicy: Always
               args:
                 - "--nproc_per_node=1"
-                - "/workspace/examples/imagenet/main.py"
-                - "--arch=resnet101"
-                - "--epochs=20"
-                - "--batch-size=32"
+                - "/workspace/examples/imagenet/baseline_simple_gcs.py"
+                - "--arch=resnet50"
+                - "--epochs=50"
+                - "--batch-size=128"
+                - "--lr=0.001"
                 # number of data loader workers (NOT trainers)
                 # zero means load the data on the same process as the trainer
                 # this is set so that the container does not OOM since
@@ -38,8 +50,14 @@ spec:
               volumeMounts:
                 - mountPath: /dev/shm
                   name: dshm
+          initContainers:
+            - name: torch-test
+              image: pytorch/pytorch:1.8.0-cuda11.1-cudnn8-runtime
+              command: ['python', '-c', 'import torch; a=torch.cuda.is_available(); assert a']
+              resources:
+                limits:
+                  nvidia.com/gpu: 1
           volumes:
           - name: dshm
             emptyDir:
               medium: Memory
-          terminationGracePeriodSeconds: 30
