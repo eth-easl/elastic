@@ -6,13 +6,16 @@ metadata:
 spec:
   # Use "etcd-service:2379" if you already apply etcd.yaml
   rdzvEndpoint: "etcd-service:2379"
-  minReplicas: 1
-  maxReplicas: 1
+  minReplicas: 2
+  maxReplicas: 2
   replicaSpecs:
     Worker:
-      replicas: 1
+      replicas: 2
       restartPolicy: ExitCode
       template:
+        metadata:
+          annotations:
+            container.apparmor.security.beta.kubernetes.io/elasticjob-worker: unconfined
         apiVersion: v1
         kind: Pod
         spec:
@@ -31,18 +34,14 @@ spec:
             - name: elasticjob-worker
               image: fotstrt/torchelastic #torchelastic/examples:0.2.0
               securityContext:
-                privileged: true
-                capabilities:
-                  add:
-                  - SYS_ADMIN
+                 privileged: false
+                 capabilities:
+                   add:
+                     - SYS_ADMIN
               lifecycle:
                 postStart:
                   exec:
-                    command:
-                    - gcsfuse
-                    - --implicit-dirs
-                    - imagenet-raw
-                    - /workspace/data/imagenet-large
+                    command: ["gcsfuse", "--implicit-dirs", "imagenet-raw-euwest4", "/workspace/data/imagenet-large"]
                 preStop:
                   exec:
                     command:
@@ -54,26 +53,28 @@ spec:
                 - "--nproc_per_node=1"
                 - "/workspace/examples/imagenet/baseline_imagenet_gcs.py"
                 - "--arch=resnet50"
-                - "--epochs=50"
+                - "--epochs=90" 
                 - "--batch-size=128"
                 - "--lr=0.1"
-                # number of data loader workers (NOT trainers)
-                # zero means load the data on the same process as the trainer
-                # this is set so that the container does not OOM since
-                # pytorch data loaders use shm
                 - "--workers=4"
                 - "/workspace/data/imagenet-large"
               resources:
+                requests:
+                    nvidia.com/gpu: 1
+                    smarter-devices/fuse: 1
                 limits:
-                  nvidia.com/gpu: 1
+                    nvidia.com/gpu: 1
+                    smarter-devices/fuse: 1
               volumeMounts:
                 - mountPath: /dev/shm
-                  name: dshm
+                  name: dshm  
           initContainers:
             - name: torch-test
               image: pytorch/pytorch:1.8.0-cuda11.1-cudnn8-runtime
               command: ['python', '-c', 'import torch; a=torch.cuda.is_available(); assert a']
               resources:
+                requests:
+                  nvidia.com/gpu: 1
                 limits:
                   nvidia.com/gpu: 1
           volumes:

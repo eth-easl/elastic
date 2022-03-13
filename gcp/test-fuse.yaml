@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: elastic-ml-worker
+spec:
+  selector:
+    app: elastic-ml-worker
+  ports:
+    - name: grpc
+      protocol: TCP
+      port: 50051
+      targetPort: 50051
+  clusterIP: None	
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: elastic-ml-worker
+  labels:
+    k8s-app: elastic-ml-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elastic-ml-worker
+  template:
+    metadata:
+      labels:
+        app: elastic-ml-worker
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: elastic-ml-worker
+        image: fotstrt/torchelastic
+        imagePullPolicy: Always
+        command:
+         - tail
+         - "-f"
+         - /dev/null
+        #command: ["python /examples/run_cifar.py --world-size=1 --node-rank=0 --proc-per-node=1 --rank=0"]
+        resources:
+          limits:
+            smarter-devices/fuse: 1
+            nvidia.com/gpu: 1
+          requests:
+            smarter-devices/fuse: 1
+            nvidia.com/gpu: 1
+        volumeMounts:
+           - mountPath: /dev/shm
+             name: dshm
+        ports:
+        - containerPort: 50051
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+      terminationGracePeriodSeconds: 30
