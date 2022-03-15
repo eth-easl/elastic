@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: smarter-device-manager
-  namespace: elastic-job
+  namespace: kube-system
   labels:
     name: smarter-device-manager
     role: agent

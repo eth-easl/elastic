@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: smarter-device-manager
-  namespace: elastic-job
+  namespace: kube-system
 data:
   conf.yaml: |
     - devicematch: ^fuse$
