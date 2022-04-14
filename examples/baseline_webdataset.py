@@ -82,9 +82,9 @@ import webdataset as wds
 # Imports the Google Cloud client library
 from google.cloud import storage
 
-#writer = SummaryWriter('gs://torchelasticlogs')
-#client = storage.Client() # need to set up credentials
-#bucket = client.get_bucket('torchelastic')
+writer = SummaryWriter('gs://torchelasticlogs')
+client = storage.Client() # need to set up credentials
+bucket = client.get_bucket('torchelastic')
 
 model_names = sorted(
     name
@@ -233,9 +233,14 @@ def main():
         #train_loader.sampler.set_epoch(epoch) - TODO: fix this
         adjust_learning_rate(optimizer, epoch, lr) # adjust on the initial lr
 
+        start = time.time()
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq, args.batch_size, state, args.checkpoint_file, args.ch_freq)
+        end = time.time()
 
+        print("------------- Epoch ", epoch, " took: ", end-start)
+
+        '''
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, device_id, print_freq)
 
@@ -247,7 +252,7 @@ def main():
 
         if rank == 0:
             save_checkpoint(state, is_best, args.checkpoint_file, 0, False)
-    
+        '''
     writer.close()
 
 class State:
@@ -336,38 +341,29 @@ def initialize_data_loader(
     )
 
     start = time.time()
-
-    train_dataset = (
-        wds.WebDataset(trainshards)
-        .shuffle(1000) # TODO: check this
-        .decode("pil")
-        .to_tuple("jpg;png;jpeg cls")
-        .map_tuple(transforms.Compose(
+    
+    train_dataset = wds.DataPipeline(
+        wds.SimpleShardList(trainshards),
+        wds.shuffle(1000), # shuffle shards before spliting them to nodes - TODO: how to enable different seed per epoch?
+        wds.split_by_node,
+        wds.shuffle(1000), # shuffle shards in the workers
+        wds.split_by_worker,
+        wds.tarfile_to_samples(),
+        wds.shuffle(1000),
+        wds.decode("pil"),
+        wds.to_tuple("jpg;png;jpeg cls"),
+        wds.map_tuple(transforms.Compose(
             [
                 transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
                 normalize,
             ]
-        ), identity)
+        ), identity),
+        wds.batched(batch_size)
     )
 
-    '''
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose(
-            [
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]
-        ),
-    )
-    '''
-
-    # ????????????
-    train_dataset = train_dataset.batched(batch_size, partial=False)
+    
 
 
     print("Defining dataset took: ", time.time()-start)
@@ -380,40 +376,11 @@ def initialize_data_loader(
     dataset_size = 1281167
     number_of_batches = dataset_size // (batch_size * world_size)
     print("# batches per node = ", number_of_batches)
-    #train_loader = train_loader.repeat(2).slice(number_of_batches)
+    train_loader = train_loader.repeat(1) #.slice(number_of_batches) TODO: check if this leads to 'each data point exactly once per epoch'
     # This only sets the value returned by the len() function; nothing else uses it,
     # but some frameworks care about it.
     train_loader.length = number_of_batches
 
-    '''
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        num_workers=num_data_workers,
-        pin_memory=True,
-        sampler=train_sampler,
-    )
-    '''
-    
-    '''
-    val_loader = DataLoader(
-        datasets.ImageFolder(
-            valdir,
-            transforms.Compose(
-                [
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    normalize,
-                ]
-            ),
-        ),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_data_workers,
-        pin_memory=True,
-    )
-    '''
     print("Total took: ", time.time()-start)
     return train_loader, None
 
@@ -441,7 +408,7 @@ def load_checkpoint(
 
     state = State(arch, model, optimizer)
 
-    '''   
+       
     allcheckp = []
     for blob in client.list_blobs('torchelastic'):
         print(blob.name, blob.updated)
@@ -467,7 +434,7 @@ def load_checkpoint(
 
     
     print(f"=> done restoring from previous checkpoint")
-    '''
+    
 
     return state
 
@@ -602,15 +569,16 @@ def train(
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % print_freq == 0:
-            progress.display(i)
+        #if i % print_freq == 0:
+        #    progress.display(i)
 
         
-
+    '''
     avg_loss = total_loss/len(train_loader)
     
     writer.add_scalar("Loss/Training Loss", avg_loss, epoch)
     writer.add_scalar("Accuracy/Training Loss", 100.0*(correct/total), epoch)
+    '''
 
 def validate(
     val_loader: DataLoader,
@@ -739,6 +707,8 @@ def accuracy(output, target, topk=(1,)):
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
